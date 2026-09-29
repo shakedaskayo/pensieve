@@ -1,6 +1,8 @@
 [package]
 name = "pensieve-cli"
-version.workspace = true
+# Ahead of the workspace 0.1.0 so `pensieve update` treats the v0.1.1
+# GitHub release as newer than binaries built from the workspace version.
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

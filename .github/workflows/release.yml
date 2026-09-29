@@ -77,7 +77,8 @@ jobs:
       - name: Package binary
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/pensieve" dist/pensieve
+          # pensieve-cli's build output is `pensieve-cli`; end users get it as `pensieve`.
+          cp "target/${{ matrix.target }}/release/pensieve-cli" dist/pensieve
           cd dist
           tar czf "${{ matrix.artifact }}.tar.gz" pensieve
           if command -v sha256sum >/dev/null 2>&1; then

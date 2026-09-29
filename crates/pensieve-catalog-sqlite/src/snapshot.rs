@@ -93,7 +93,7 @@ impl SnapshotTxn for SqliteSnapshotTxn {
         })
         .to_string();
 
-        let mut tx = pool.begin().await.map_err(ce)?;
+        let mut tx = super::begin_immediate(&pool).await.map_err(ce)?;
 
         // Compute the new sequence number from the parent's sequence + 1.
         let parent_seq: i64 =

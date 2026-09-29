@@ -657,7 +657,11 @@ async fn tenant_quota_round_trip_and_upsert_in_place() {
     })
     .await
     .unwrap();
-    let got = cat.get_tenant_quota(t).await.unwrap().expect("quota present");
+    let got = cat
+        .get_tenant_quota(t)
+        .await
+        .unwrap()
+        .expect("quota present");
     assert_eq!(got.max_query_concurrent, Some(5));
     assert_eq!(got.max_agent_concurrent, None);
     assert_eq!(cat.list_tenant_quotas().await.unwrap().len(), 1);
@@ -679,4 +683,59 @@ async fn tenant_quota_round_trip_and_upsert_in_place() {
         1,
         "upsert must update in place, not insert a second row"
     );
+}
+
+#[tokio::test]
+async fn gc_history_keeps_the_current_snapshot_and_live_extents() {
+    let cat = fresh().await;
+    let db = cat.create_database("default").await.unwrap();
+    let table_id = cat
+        .create_table(db, "logs", sample_schema(), TableConfig::default())
+        .await
+        .unwrap();
+    let tref = cat.lookup_table("default", "logs").await.unwrap();
+    for _ in 0..3 {
+        let mut txn = cat.begin_snapshot(table_id).await.unwrap();
+        txn.add_extent(extent_for(&tref, &["info"])).await.unwrap();
+        txn.commit(SnapshotSummary {
+            operation: "ingest".into(),
+            rows_added: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    // Negative age: every snapshot written in this test is old enough.
+    let stats = cat
+        .gc_history(chrono::Duration::seconds(-5), 100)
+        .await
+        .unwrap();
+    // bootstrap + 3 commits = 4 snapshots; the current one stays.
+    // Bootstrap has no manifest row. The current commit's manifest stays,
+    // so the two superseded commits are the ones reclaimed.
+    assert_eq!(stats.snapshots_deleted, 3);
+    assert_eq!(stats.manifests_deleted, 2);
+
+    let tref = cat.lookup_table("default", "logs").await.unwrap();
+    let live = cat
+        .list_extents(
+            table_id,
+            tref.current_snapshot_id,
+            &PrunePredicate::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(live.len(), 3, "live extents survive snapshot gc");
+
+    // The kept snapshot is a valid parent for the next commit.
+    let mut txn = cat.begin_snapshot(table_id).await.unwrap();
+    txn.add_extent(extent_for(&tref, &["warn"])).await.unwrap();
+    txn.commit(SnapshotSummary {
+        operation: "ingest".into(),
+        rows_added: 1,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
 }
