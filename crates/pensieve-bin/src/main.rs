@@ -113,8 +113,19 @@ fn role_components(role: &str) -> RoleComponents {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// Worker threads are 8 MiB. tokio-macros 2.7 has no `thread_stack_size`
+// argument on `#[tokio::main]`; the iterative ingest scanner is the real
+// guard, and this stack is the backstop for other recursive walks.
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     use opentelemetry::trace::TracerProvider as _;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;

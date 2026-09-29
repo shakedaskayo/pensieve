@@ -20,11 +20,11 @@
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use futures::StreamExt;
+use object_store::path::Path;
+use object_store::ObjectStore;
 use pensieve_core::catalog::Catalog;
 use pensieve_core::errors::{Error, Result};
 use pensieve_ingest_core::{ensure_table, evolve_schema_for_records, WritePath};
-use object_store::path::Path;
-use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::sync::Arc;
@@ -234,7 +234,12 @@ impl FiledropWatcher {
             }
         }
         if total_seen > 0 {
-            debug!(seen = total_seen, processed = total_processed, errors = total_errors, "filedrop scan complete");
+            debug!(
+                seen = total_seen,
+                processed = total_processed,
+                errors = total_errors,
+                "filedrop scan complete"
+            );
         }
         Ok(FiledropScan {
             seen: total_seen,
@@ -287,12 +292,16 @@ impl FiledropWatcher {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        let table_ref = if matches!(ext.as_str(), "ndjson" | "jsonl" | "json") && self.config.schema_evolve {
+        let table_ref = if matches!(ext.as_str(), "ndjson" | "jsonl" | "json")
+            && self.config.schema_evolve
+        {
             // Pre-scan for new top-level keys so the schema is up-to-date
             // before parse_ndjson runs (which would otherwise drop them).
             match parse_records_for_inspection(&bytes) {
                 Ok(records) => {
-                    match evolve_schema_for_records(&*self.catalog, &database, table_ref, &records).await {
+                    match evolve_schema_for_records(&*self.catalog, &database, table_ref, &records)
+                        .await
+                    {
                         Ok(t) => t,
                         Err(e) => {
                             warn!(error = %e, "schema_evolve failed; continuing with current schema");
@@ -399,16 +408,8 @@ fn parse_ndjson(bytes: &[u8], schema: &Arc<Schema>) -> Result<Vec<RecordBatch>> 
 /// 12-line function. If a third frontend grows this, hoist it.
 fn parse_records_for_inspection(
     bytes: &[u8],
-) -> std::result::Result<Vec<serde_json::Value>, serde_json::Error> {
-    let mut out = Vec::new();
-    for line in bytes.split(|&b| b == b'\n') {
-        if line.iter().all(|b| b.is_ascii_whitespace()) {
-            continue;
-        }
-        let v: serde_json::Value = serde_json::from_slice(line)?;
-        out.push(v);
-    }
-    Ok(out)
+) -> std::result::Result<Vec<serde_json::Value>, String> {
+    pensieve_ingest_core::records_for_schema_evolve(bytes)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

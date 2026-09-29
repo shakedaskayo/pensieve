@@ -43,17 +43,38 @@ use pensieve_core::index_sidecar::{IndexSidecarDescriptor, SidecarKind};
 use pensieve_core::tenant::{TenantId, DEFAULT_TENANT};
 use pensieve_core::types::{DatabaseId, ExtentId, NodeId, SchemaSnapshotId, SnapshotId, TableId};
 use serde_json::Value as Json;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, SqlitePool};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Rows dropped by [`SqliteCatalog::gc_history`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogGcStats {
+    pub snapshots_deleted: u64,
+    pub manifests_deleted: u64,
+    pub tasks_deleted: u64,
+}
 
 /// The embedded SQLite-backed catalog. Holds a connection pool; cloneable and
 /// thread-safe.
 #[derive(Debug, Clone)]
 pub struct SqliteCatalog {
     pool: SqlitePool,
+}
+
+/// `BEGIN IMMEDIATE` so a writer waits on the SQLite lock instead of failing
+/// with `SQLITE_BUSY_SNAPSHOT`. `busy_timeout` covers that wait; a deferred
+/// transaction that upgrades to a write does not, and the local process has
+/// several background writers (ingest, compaction, schedulers).
+pub(crate) async fn begin_immediate(
+    pool: &SqlitePool,
+) -> sqlx::Result<Transaction<'static, Sqlite>> {
+    let conn = pool.acquire().await?;
+    Transaction::begin(conn, Some(std::borrow::Cow::Borrowed("BEGIN IMMEDIATE"))).await
 }
 
 impl SqliteCatalog {
@@ -65,8 +86,16 @@ impl SqliteCatalog {
             .map_err(ce)?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            // WAL + NORMAL is the durable setting SQLite recommends for
+            // concurrent readers. FULL fsyncs every commit and turns a
+            // burst of small ingests into a disk-bound stall.
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(10))
-            .foreign_keys(false);
+            .foreign_keys(false)
+            .pragma("cache_size", "-65536")
+            .pragma("temp_store", "MEMORY")
+            .pragma("mmap_size", "268435456")
+            .pragma("wal_autocheckpoint", "1000");
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(opts)
@@ -112,6 +141,117 @@ impl SqliteCatalog {
     /// Borrow the underlying pool (for the local-mode wiring and tests).
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Drop snapshot history the engine no longer reads.
+    ///
+    /// Every ingest inserts a snapshot and a manifest, and nothing else
+    /// deletes them. Queries list live extents (`deleted_at IS NULL`), and a
+    /// commit only needs the table's *current* snapshot row to compute the
+    /// next sequence number. Left alone, a laptop capture stream grows the
+    /// catalog without bound (observed: ~92k snapshots for 26 live extents,
+    /// and a 234 MiB file that was mostly free pages).
+    ///
+    /// `min_age` keeps recently superseded snapshots so an in-flight commit
+    /// can still read the parent it captured. `batch` caps each statement so
+    /// one tick does not hold the write lock across the whole history.
+    pub async fn gc_history(
+        &self,
+        min_age: chrono::Duration,
+        batch: i64,
+    ) -> Result<CatalogGcStats> {
+        let cutoff = Utc::now() - min_age;
+        let mut stats = CatalogGcStats::default();
+
+        let manifests = sqlx::query(
+            "DELETE FROM manifests WHERE snapshot_id IN (
+                 SELECT id FROM snapshots
+                 WHERE created_at < ?
+                   AND id NOT IN (
+                       SELECT current_snapshot_id FROM tables
+                       WHERE current_snapshot_id IS NOT NULL
+                   )
+                 LIMIT ?
+             )",
+        )
+        .bind(cutoff)
+        .bind(batch)
+        .execute(&self.pool)
+        .await
+        .map_err(ce)?;
+        stats.manifests_deleted += manifests.rows_affected();
+
+        let snapshots = sqlx::query(
+            "DELETE FROM snapshots WHERE id IN (
+                 SELECT id FROM snapshots
+                 WHERE created_at < ?
+                   AND id NOT IN (
+                       SELECT current_snapshot_id FROM tables
+                       WHERE current_snapshot_id IS NOT NULL
+                   )
+                 LIMIT ?
+             )",
+        )
+        .bind(cutoff)
+        .bind(batch)
+        .execute(&self.pool)
+        .await
+        .map_err(ce)?;
+        stats.snapshots_deleted += snapshots.rows_affected();
+
+        // Manifests whose snapshot row is already gone (a previous tick
+        // deleted the snapshot first, or a crash between the two deletes).
+        let orphans = sqlx::query(
+            "DELETE FROM manifests WHERE rowid IN (
+                 SELECT m.rowid FROM manifests m
+                 LEFT JOIN snapshots s ON s.id = m.snapshot_id
+                 WHERE s.id IS NULL
+                 LIMIT ?
+             )",
+        )
+        .bind(batch)
+        .execute(&self.pool)
+        .await
+        .map_err(ce)?;
+        stats.manifests_deleted += orphans.rows_affected();
+
+        let tasks = sqlx::query(
+            "DELETE FROM background_tasks WHERE id IN (
+                 SELECT id FROM background_tasks
+                 WHERE status = 'done' AND updated_at < ?
+                 LIMIT ?
+             )",
+        )
+        .bind(cutoff)
+        .bind(batch)
+        .execute(&self.pool)
+        .await
+        .map_err(ce)?;
+        stats.tasks_deleted += tasks.rows_affected();
+
+        Ok(stats)
+    }
+
+    /// Rewrite the file when free pages dominate it. Best-effort: VACUUM
+    /// needs a moment with no other writer, and a busy catalog skips it.
+    /// Freelist pages are reused either way, so skipping does not leak.
+    pub async fn reclaim_free_pages(&self) -> Result<bool> {
+        let free: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(ce)?;
+        let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(ce)?;
+        if free < 10_000 || pages == 0 || free * 2 < pages {
+            return Ok(false);
+        }
+        sqlx::query("VACUUM")
+            .execute(&self.pool)
+            .await
+            .map_err(ce)?;
+        Ok(true)
     }
 
     /// Read a sync watermark / state value by key (e.g. memory push/pull
@@ -609,7 +749,7 @@ impl Catalog for SqliteCatalog {
         let config_json =
             serde_json::to_string(&config).map_err(|e| CatalogError::Sql(e.to_string()))?;
 
-        let mut tx = self.pool.begin().await.map_err(ce)?;
+        let mut tx = begin_immediate(&self.pool).await.map_err(ce)?;
 
         // 0. Verify the database belongs to this tenant.
         let db_tenant: Option<Uuid> =
@@ -813,7 +953,7 @@ impl Catalog for SqliteCatalog {
         .map_err(ce)?;
         let Some(id) = id else { return Ok(false) };
 
-        let mut tx = self.pool.begin().await.map_err(ce)?;
+        let mut tx = begin_immediate(&self.pool).await.map_err(ce)?;
         sqlx::query("DELETE FROM extents WHERE table_id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -955,7 +1095,7 @@ impl Catalog for SqliteCatalog {
     ) -> Result<SchemaSnapshotId> {
         let _ = string_to_arrow_type(column_type)?; // reject garbage early
 
-        let mut tx = self.pool.begin().await.map_err(ce)?;
+        let mut tx = begin_immediate(&self.pool).await.map_err(ce)?;
 
         let row = sqlx::query(
             "SELECT t.tenant_id AS tenant_id, t.schema_snapshot_id AS schema_snapshot_id,
@@ -1381,10 +1521,7 @@ impl Catalog for SqliteCatalog {
 
     // ------------------------- per-tenant quotas (S2.6) -------------------------
 
-    async fn upsert_tenant_quota(
-        &self,
-        quota: &pensieve_core::catalog::TenantQuota,
-    ) -> Result<()> {
+    async fn upsert_tenant_quota(&self, quota: &pensieve_core::catalog::TenantQuota) -> Result<()> {
         let now = Utc::now();
         let updated = sqlx::query(
             "UPDATE tenant_quotas
@@ -1428,12 +1565,14 @@ impl Catalog for SqliteCatalog {
         .fetch_optional(&self.pool)
         .await
         .map_err(ce)?;
-        Ok(row.map(|(q, a, updated_at)| pensieve_core::catalog::TenantQuota {
-            tenant,
-            max_query_concurrent: q.map(|v| v.max(0) as u32),
-            max_agent_concurrent: a.map(|v| v.max(0) as u32),
-            updated_at,
-        }))
+        Ok(
+            row.map(|(q, a, updated_at)| pensieve_core::catalog::TenantQuota {
+                tenant,
+                max_query_concurrent: q.map(|v| v.max(0) as u32),
+                max_agent_concurrent: a.map(|v| v.max(0) as u32),
+                updated_at,
+            }),
+        )
     }
 
     async fn list_tenant_quotas(&self) -> Result<Vec<pensieve_core::catalog::TenantQuota>> {
@@ -1446,12 +1585,14 @@ impl Catalog for SqliteCatalog {
         .map_err(ce)?;
         Ok(rows
             .into_iter()
-            .map(|(t, q, a, updated_at)| pensieve_core::catalog::TenantQuota {
-                tenant: TenantId::from_uuid(t),
-                max_query_concurrent: q.map(|v| v.max(0) as u32),
-                max_agent_concurrent: a.map(|v| v.max(0) as u32),
-                updated_at,
-            })
+            .map(
+                |(t, q, a, updated_at)| pensieve_core::catalog::TenantQuota {
+                    tenant: TenantId::from_uuid(t),
+                    max_query_concurrent: q.map(|v| v.max(0) as u32),
+                    max_agent_concurrent: a.map(|v| v.max(0) as u32),
+                    updated_at,
+                },
+            )
             .collect())
     }
 
@@ -1727,7 +1868,7 @@ impl Catalog for SqliteCatalog {
         lease: chrono::Duration,
     ) -> Result<Option<BackgroundTask>> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await.map_err(ce)?;
+        let mut tx = begin_immediate(&self.pool).await.map_err(ce)?;
         // Pick the next runnable task: pending, or a running task whose claim expired.
         let row = sqlx::query(
             "SELECT id, kind, table_id, payload, priority, attempt, max_attempts
@@ -1907,7 +2048,7 @@ impl Catalog for SqliteCatalog {
         id: uuid::Uuid,
         patch: DashboardUpdate,
     ) -> Result<Dashboard, CatalogError> {
-        let mut tx = self.pool.begin().await.map_err(ce)?;
+        let mut tx = begin_immediate(&self.pool).await.map_err(ce)?;
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM dashboards WHERE tenant_id = ? AND id = ?)",
         )
@@ -2021,7 +2162,7 @@ impl Catalog for SqliteCatalog {
         tenant: TenantId,
         id: uuid::Uuid,
     ) -> Result<bool, CatalogError> {
-        let mut tx = self.pool.begin().await.map_err(ce)?;
+        let mut tx = begin_immediate(&self.pool).await.map_err(ce)?;
         sqlx::query("DELETE FROM dashboard_panels WHERE tenant_id = ? AND dashboard_id = ?")
             .bind(tenant.as_uuid())
             .bind(id)
@@ -2664,7 +2805,7 @@ impl Catalog for SqliteCatalog {
             return Ok(());
         }
         let now = Utc::now();
-        let mut tx = self.pool.begin().await.map_err(ce)?;
+        let mut tx = begin_immediate(&self.pool).await.map_err(ce)?;
         for (hash, vec) in entries {
             let bytes = pensieve_core::catalog::embedding_to_le_bytes(vec);
             sqlx::query(

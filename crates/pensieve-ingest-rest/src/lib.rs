@@ -33,8 +33,8 @@ use std::sync::Arc;
 
 mod rate_limit;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tracing::{error, info, warn};
 use tracing::Instrument as _;
+use tracing::{error, info, warn};
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -131,7 +131,18 @@ async fn ingest_handler(State(state): State<IngestState>, req: Request) -> Respo
         ingest.table = %table,
         ingest.rows = tracing::field::Empty,
     );
-    ingest_batch_inner(state, request_id, database, table, idempotency_key, auto_create, schema_evolve, body, ingest_span).await
+    ingest_batch_inner(
+        state,
+        request_id,
+        database,
+        table,
+        idempotency_key,
+        auto_create,
+        schema_evolve,
+        body,
+        ingest_span,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -411,7 +422,8 @@ fn rate_limited_response(retry_after_secs: f64, request_id: &str) -> Response {
         request_id,
     );
     if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
-        resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, v);
     }
     resp
 }
@@ -455,14 +467,10 @@ fn header_bool(headers: &HeaderMap, name: &str, default: bool) -> bool {
 
 /// Cheap NDJSON pre-scan that yields the same `serde_json::Value`s the
 /// schema-evolve helper expects. Used only when X-Schema-Evolve is on.
-fn parse_records_for_inspection(bytes: &[u8]) -> std::result::Result<Vec<serde_json::Value>, serde_json::Error> {
-    let mut out = Vec::new();
-    for line in bytes.split(|&b| b == b'\n') {
-        if line.iter().all(|b| b.is_ascii_whitespace()) {
-            continue;
-        }
-        let v: serde_json::Value = serde_json::from_slice(line)?;
-        out.push(v);
-    }
-    Ok(out)
+fn parse_records_for_inspection(
+    bytes: &[u8],
+) -> std::result::Result<Vec<serde_json::Value>, String> {
+    // Keys only. A full `serde_json::Value` decode recurses on nested tool
+    // payloads and overflows the Tokio worker stack.
+    pensieve_ingest_core::records_for_schema_evolve(bytes)
 }

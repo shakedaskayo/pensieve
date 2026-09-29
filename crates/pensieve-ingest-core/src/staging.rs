@@ -31,7 +31,9 @@
 
 use arrow_array::RecordBatch;
 use chrono::Utc;
-use pensieve_core::catalog::{Catalog, ExtentManifest, IngestLedgerEntry, SnapshotSummary, TableRef};
+use pensieve_core::catalog::{
+    Catalog, ExtentManifest, IngestLedgerEntry, SnapshotSummary, TableRef,
+};
 use pensieve_core::errors::{CatalogError, Error, Result};
 use pensieve_core::segment_format::{ExtentWriteResult, SegmentFormat};
 use pensieve_core::types::{SnapshotId, TableId};
@@ -526,9 +528,19 @@ async fn lookup_by_id(catalog: &dyn Catalog, table_id: TableId) -> Result<Option
         }
         return Ok(None);
     }
-    Err(Error::Internal(
-        "staging buffer requires PostgresCatalog (phase-C shortcut)".into(),
-    ))
+    // Local mode (and any non-Postgres catalog) has no pool to query. A
+    // flush happens once per batch, and a single-binary catalog only has a
+    // handful of databases, so a trait walk is cheap enough.
+    let dbs = catalog.list_databases().await.map_err(Error::Catalog)?;
+    for db_name in dbs {
+        let tables = catalog.list_tables_in_database(&db_name).await?;
+        for t in tables {
+            if t.id == table_id {
+                return Ok(Some(t));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn extent_write_result_to_manifest(table: &TableRef, r: &ExtentWriteResult) -> ExtentManifest {

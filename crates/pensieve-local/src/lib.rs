@@ -72,7 +72,7 @@ use pensieve_datasources::scheduler::DataSourceScheduler;
 use pensieve_datasources::secrets::EnvSecretStore;
 use pensieve_format_tlm::TelemetryFormat;
 use pensieve_ingest_core::events::IngestEvents;
-use pensieve_ingest_core::WritePath;
+use pensieve_ingest_core::{StagingBuffer, StagingConfig, WritePath};
 use pensieve_ingest_otlp::self_export::{SelfTraceCtx, SelfTraceExporter};
 use pensieve_ingest_rest::IngestState;
 use pensieve_mcp::{serve_stdio, McpState, ServerInfo, ToolDispatch};
@@ -181,8 +181,9 @@ async fn open_engine(paths: &Paths) -> Result<Engine> {
     // store can mix them.
     let tlm_fmt: Arc<dyn SegmentFormat> =
         Arc::new(TelemetryFormat::new(store.clone(), "pensieve-local"));
-    let parquet_fmt: Arc<dyn SegmentFormat> =
-        Arc::new(pensieve_format_parquet::ParquetFormat::new(store, "pensieve-local"));
+    let parquet_fmt: Arc<dyn SegmentFormat> = Arc::new(
+        pensieve_format_parquet::ParquetFormat::new(store, "pensieve-local"),
+    );
     let format: Arc<dyn SegmentFormat> =
         if std::env::var("PENSIEVE_WRITE_FORMAT").as_deref() == Ok("parquet") {
             Arc::new(pensieve_core::segment_format::FormatRegistry::new(
@@ -456,8 +457,21 @@ pub fn build_local_app(
         consumer_events: Some(consumer_events.clone()),
     };
     let ingest_events = IngestEvents::new(256);
-    let write_path =
-        WritePath::new(catalog.clone(), format.clone()).with_events(ingest_events.clone());
+    // Group-commit by default. Without it every capture POST is its own
+    // snapshot, and a laptop running coding-agent hooks grows tens of
+    // thousands of catalog rows. `PENSIEVE_STAGING_DISABLED=1` keeps the
+    // one-extent-per-request path for tests that depend on it.
+    let write_path = if std::env::var("PENSIEVE_STAGING_DISABLED").ok().as_deref() == Some("1") {
+        WritePath::new(catalog.clone(), format.clone()).with_events(ingest_events.clone())
+    } else {
+        let staging =
+            StagingBuffer::new(catalog.clone(), format.clone(), StagingConfig::from_env());
+        let timer = staging.clone();
+        tokio::spawn(timer.run_timer(std::future::pending()));
+        tracing::info!("local ingest staging: group-commit enabled");
+        WritePath::with_staging(catalog.clone(), format.clone(), staging)
+            .with_events(ingest_events.clone())
+    };
     let ingest_state = IngestState {
         catalog: catalog.clone(),
         write_path,
@@ -623,15 +637,14 @@ pub fn build_local_app(
     );
     let brain_mgmt_router =
         pensieve_server::brain::routes::brain_router(brain_state.clone()).layer(read_mw());
-    let brain_git_router = pensieve_server::brain::git_http::git_http_router(brain_state.clone()).layer(
-        axum::middleware::from_fn_with_state(
+    let brain_git_router = pensieve_server::brain::git_http::git_http_router(brain_state.clone())
+        .layer(axum::middleware::from_fn_with_state(
             AuthLayerState {
                 backend: backend.clone(),
                 required: Role::Read,
             },
             pensieve_server::auth::require_git_auth_middleware,
-        ),
-    );
+        ));
 
     let mut app = read_router
         .merge(ingest_router)
@@ -738,7 +751,8 @@ pub async fn run_serve(
     // Degraded local-mode dreaming state: in-memory ring hydrated from the
     // embedded SQLite catalog. Inline runs + the dreaming HTTP handlers read it.
     let local_dreaming = Some(
-        pensieve_server::agent::dreaming_local::LocalDreamingStore::new(engine.catalog.clone()).await,
+        pensieve_server::agent::dreaming_local::LocalDreamingStore::new(engine.catalog.clone())
+            .await,
     );
     // Loopback URL for this serve's own MCP endpoint, so the ClaudeCli engine
     // can reach the local memory/data tools during a dreaming run. When bound
@@ -796,17 +810,25 @@ pub async fn run_serve(
     // Register all supported connectors (same set as the hosted server).
     use pensieve_datasources::prometheus::PromDataSource;
     conn_reg.register(Arc::new(PromDataSource));
-    conn_reg.register(Arc::new(pensieve_datasources::postgres::PgIntrospectDataSource));
+    conn_reg.register(Arc::new(
+        pensieve_datasources::postgres::PgIntrospectDataSource,
+    ));
     conn_reg.register(Arc::new(pensieve_datasources::s3::S3DataSource));
     conn_reg.register(Arc::new(pensieve_datasources::gitlab::GitlabDataSource));
-    conn_reg.register(Arc::new(pensieve_datasources::bitbucket::BitbucketDataSource));
+    conn_reg.register(Arc::new(
+        pensieve_datasources::bitbucket::BitbucketDataSource,
+    ));
     conn_reg.register(Arc::new(pensieve_datasources::github::GithubDataSource));
     conn_reg.register(Arc::new(pensieve_datasources::notion::NotionDataSource));
-    conn_reg.register(Arc::new(pensieve_datasources::googledrive::GdriveDataSource));
+    conn_reg.register(Arc::new(
+        pensieve_datasources::googledrive::GdriveDataSource,
+    ));
     conn_reg.register(Arc::new(pensieve_datasources::gmail::GmailDataSource));
     conn_reg.register(Arc::new(pensieve_datasources::slack::SlackDataSource));
     conn_reg.register(Arc::new(pensieve_datasources::jira::JiraDataSource));
-    conn_reg.register(Arc::new(pensieve_datasources::confluence::ConfluenceDataSource));
+    conn_reg.register(Arc::new(
+        pensieve_datasources::confluence::ConfluenceDataSource,
+    ));
     conn_reg.register(Arc::new(pensieve_datasources::msfabric::MsFabricDataSource));
     conn_reg.register(Arc::new(pensieve_datasources::obsidian::ObsidianDataSource));
     let conn_registry = Arc::new(conn_reg);
@@ -831,8 +853,9 @@ pub async fn run_serve(
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("evolve_schema: {e}"))?;
-                let batches = pensieve_datasources::arrow_coerce::rows_to_batches(&table.schema, rows)
-                    .map_err(|e| anyhow::anyhow!("arrow coerce: {e}"))?;
+                let batches =
+                    pensieve_datasources::arrow_coerce::rows_to_batches(&table.schema, rows)
+                        .map_err(|e| anyhow::anyhow!("arrow coerce: {e}"))?;
                 write_path
                     .ingest_with_idempotency(&db, &table, batches, idem.as_deref())
                     .await
@@ -944,12 +967,14 @@ pub async fn run_serve(
                 pensieve_core::index_sidecar::SidecarKind::TantivyFts,
                 Arc::new(pensieve_index_fts::TantivyFtsBuilder::new()),
             );
-            exec_reg.register(Arc::new(pensieve_jobs::index_build::IndexBuildExecutor::new(
-                engine.catalog.clone(),
-                engine.format.clone(),
-                store,
-                builders,
-            )));
+            exec_reg.register(Arc::new(
+                pensieve_jobs::index_build::IndexBuildExecutor::new(
+                    engine.catalog.clone(),
+                    engine.format.clone(),
+                    store,
+                    builders,
+                ),
+            ));
             // The embed_backfill executor needs the process embedding backend.
             // If unavailable (provider feature off) only ANN/FTS over already-
             // embedded data activate; embeddings stay as ingested.
@@ -1014,8 +1039,10 @@ pub async fn run_serve(
     // enabled in ${PENSIEVE_HOME}/memory-settings.json (OFF by default). Runs inline
     // in this process; no worker fabric.
     if let Some(store) = local_dreaming {
-        let scheduler =
-            pensieve_server::agent::dreaming::LocalDreamingScheduler::new(agent_state.clone(), store);
+        let scheduler = pensieve_server::agent::dreaming::LocalDreamingScheduler::new(
+            agent_state.clone(),
+            store,
+        );
         tokio::spawn(async move {
             scheduler
                 .run(async {
@@ -1078,6 +1105,57 @@ pub async fn run_serve(
             let _ = tokio::signal::ctrl_c().await;
         }));
         info!("local compaction worker + scheduler running");
+    }
+
+    // Snapshot + manifest + finished-task rows are append-only unless something
+    // deletes them. Queries don't read superseded snapshots, so reclaim them.
+    {
+        let sqlite = engine.sqlite.clone();
+        tokio::spawn(async move {
+            loop {
+                match sqlite
+                    .gc_history(chrono::Duration::minutes(10), 2_000)
+                    .await
+                {
+                    Ok(stats) => {
+                        let n =
+                            stats.snapshots_deleted + stats.manifests_deleted + stats.tasks_deleted;
+                        if n > 0 {
+                            info!(
+                                snapshots = stats.snapshots_deleted,
+                                manifests = stats.manifests_deleted,
+                                tasks = stats.tasks_deleted,
+                                "catalog gc reclaimed superseded snapshot history"
+                            );
+                        }
+                        let drained = stats.snapshots_deleted < 2_000
+                            && stats.manifests_deleted < 2_000
+                            && stats.tasks_deleted < 2_000;
+                        if drained {
+                            // Retry while the freelist is still large. A busy
+                            // pool makes VACUUM fail, and the next ticks delete
+                            // nothing, so gating this on snapshots_deleted
+                            // would leave the file bloated forever.
+                            match sqlite.reclaim_free_pages().await {
+                                Ok(true) => info!("catalog vacuum reclaimed free pages"),
+                                Ok(false) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "catalog vacuum skipped")
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "catalog gc failed");
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                }
+            }
+        });
+        info!("local catalog gc running (snapshot history + finished tasks)");
     }
 
     // Vault watchers: continuous sync loops for continuous-drive data sources
@@ -1156,7 +1234,9 @@ pub async fn run_serve(
     info!("  ingest:   POST http://{addr}/v1/ingest   (X-Database / X-Table headers)");
     info!("  MCP:      http://{addr}/mcp/v1");
     if password == "admin" {
-        warn!("using the default local password 'admin' — set PENSIEVE_LOCAL_PASSWORD to change it");
+        warn!(
+            "using the default local password 'admin' — set PENSIEVE_LOCAL_PASSWORD to change it"
+        );
     }
     // `into_make_service_with_connect_info` so handlers can read the peer addr
     // (the live-consumers overlay records the connecting agent's ip/pid).
@@ -1310,8 +1390,11 @@ async fn run_cc_phase(
 /// `$HOME/.pensieve`, not `PENSIEVE_HOME`-relative, matching the hook-side
 /// `capture-health.json` convention so both processes agree on the path.
 fn cc_sync_health_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".pensieve").join("cc-sync-health.json"))
+    std::env::var_os("HOME").map(|h| {
+        std::path::PathBuf::from(h)
+            .join(".pensieve")
+            .join("cc-sync-health.json")
+    })
 }
 
 /// Record the outcome of a cc-sync pass so `pensieve status` can report sync

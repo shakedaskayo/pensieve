@@ -514,8 +514,19 @@ enum SessionsOp {
     Delete { id: String },
 }
 
-#[tokio::main]
-async fn main() {
+// Worker threads are 8 MiB. tokio-macros 2.7 has no `thread_stack_size`
+// argument on `#[tokio::main]`; the iterative ingest scanner is the real
+// guard, and this stack is the backstop for other recursive walks.
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() {
     let cli = Cli::parse();
     ux::theme::init(cli.no_color);
     if let Err(err) = run(cli).await {

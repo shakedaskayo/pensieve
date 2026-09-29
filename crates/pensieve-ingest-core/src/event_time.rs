@@ -22,9 +22,10 @@ use std::borrow::Cow;
 /// `at` field (pass-through; not our table shape).
 pub fn populate_at_column<'a>(bytes: &'a [u8], schema: &SchemaRef) -> Cow<'a, [u8]> {
     // Only activate when the schema has an `at` field with a Timestamp type.
-    let has_at_timestamp = schema.fields().iter().any(|f| {
-        f.name() == "at" && matches!(f.data_type(), DataType::Timestamp(..))
-    });
+    let has_at_timestamp = schema
+        .fields()
+        .iter()
+        .any(|f| f.name() == "at" && matches!(f.data_type(), DataType::Timestamp(..)));
     if !has_at_timestamp {
         return Cow::Borrowed(bytes);
     }
@@ -38,11 +39,9 @@ pub fn populate_at_column<'a>(bytes: &'a [u8], schema: &SchemaRef) -> Cow<'a, [u
     // carry `at`, or no schema-supported aliases exist).
     //
     // Pass 2 — only runs when pass 1 found at least one line that needs
-    // rewriting. Re-parses every line and builds the output Vec.
-    //
-    // The double parse in the rewrite case is intentional: keeping pass 1 pure
-    // (no retained allocations between lines) is simpler and the allocation-free
-    // fast path is what matters for throughput.
+    // rewriting. Re-scans every line and splices `"at"` into the original
+    // bytes. Nested payloads are never decoded: a recursive `serde_json::Value`
+    // parse here overflows the Tokio worker stack and aborts the process.
 
     // ------------------------------------------------------------------
     // Pass 1: determine whether any rewriting is needed.
@@ -51,19 +50,7 @@ pub fn populate_at_column<'a>(bytes: &'a [u8], schema: &SchemaRef) -> Cow<'a, [u
         if line.iter().all(|b| b.is_ascii_whitespace()) {
             return false;
         }
-        let obj: serde_json::Map<String, serde_json::Value> =
-            match serde_json::from_slice(line) {
-                Ok(serde_json::Value::Object(m)) => m,
-                _ => return false, // malformed — never needs injection
-            };
-        // Needs injection only when at is absent/null AND an alias is present.
-        let at_missing_or_null = matches!(obj.get("at"), None | Some(serde_json::Value::Null));
-        if !at_missing_or_null {
-            return false;
-        }
-        obj.contains_key("timestamp")
-            || obj.contains_key("time_unix_nano")
-            || obj.contains_key("observed_time_unix_nano")
+        plan_injection(line).is_some()
     });
 
     if !any_needs_injection {
@@ -76,7 +63,6 @@ pub fn populate_at_column<'a>(bytes: &'a [u8], schema: &SchemaRef) -> Cow<'a, [u
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 64);
 
     for line in bytes.split(|&b| b == b'\n') {
-        // Skip empty / whitespace-only lines.
         if line.iter().all(|b| b.is_ascii_whitespace()) {
             if !out.is_empty() {
                 out.push(b'\n');
@@ -84,80 +70,105 @@ pub fn populate_at_column<'a>(bytes: &'a [u8], schema: &SchemaRef) -> Cow<'a, [u
             continue;
         }
 
-        // Try to parse as a JSON object. On failure, pass through verbatim.
-        let mut obj: serde_json::Map<String, serde_json::Value> =
-            match serde_json::from_slice(line) {
-                Ok(serde_json::Value::Object(m)) => m,
-                _ => {
-                    // Not a JSON object (or invalid JSON): copy verbatim.
-                    if !out.is_empty() {
-                        out.push(b'\n');
-                    }
-                    out.extend_from_slice(line);
-                    continue;
-                }
-            };
-
-        // If "at" is already present and non-null, leave the line unchanged.
-        let needs_injection = matches!(
-            obj.get("at"),
-            None | Some(serde_json::Value::Null)
-        );
-
-        if !needs_injection {
-            if !out.is_empty() {
-                out.push(b'\n');
-            }
-            out.extend_from_slice(line);
-            continue;
+        if !out.is_empty() {
+            out.push(b'\n');
         }
-
-        // Try to find an alias value.
-        let resolved = resolve_at_from_aliases(&obj);
-
-        match resolved {
-            Some(rfc3339) => {
-                obj.insert("at".to_string(), serde_json::Value::String(rfc3339));
-                if !out.is_empty() {
-                    out.push(b'\n');
-                }
-                serde_json::to_writer(&mut out, &obj).expect("serializing a valid object never fails");
-            }
-            None => {
-                // No alias found; leave as-is.
-                if !out.is_empty() {
-                    out.push(b'\n');
-                }
-                out.extend_from_slice(line);
-            }
+        match plan_injection(line) {
+            Some(plan) => splice_at(&mut out, line, &plan),
+            None => out.extend_from_slice(line),
         }
     }
 
     Cow::Owned(out)
 }
 
+struct Injection {
+    /// `Some` when `"at"` is present and should be replaced (it was null).
+    /// `None` when the key is absent and should be inserted after `{`.
+    replace: Option<std::ops::Range<usize>>,
+    rfc3339: String,
+}
+
+/// `Some` when this line needs an `at` value spliced in.
+fn plan_injection(line: &[u8]) -> Option<Injection> {
+    let crate::json_scan::Line::Object(fields) = crate::json_scan::scan_line(line).ok()? else {
+        return None;
+    };
+    let at = crate::json_scan::find(&fields, "at");
+    let at_missing_or_null = match at {
+        None => true,
+        Some(f) => matches!(f.value, crate::json_scan::JsonVal::Null),
+    };
+    if !at_missing_or_null {
+        return None;
+    }
+    let rfc3339 = resolve_at_from_aliases(&fields)?;
+    let replace = at
+        .filter(|f| matches!(f.value, crate::json_scan::JsonVal::Null))
+        .map(|f| f.range.clone());
+    Some(Injection { replace, rfc3339 })
+}
+
+fn splice_at(out: &mut Vec<u8>, line: &[u8], plan: &Injection) {
+    let quoted = format!("\"{}\"", plan.rfc3339);
+    if let Some(range) = &plan.replace {
+        out.extend_from_slice(&line[..range.start]);
+        out.extend_from_slice(quoted.as_bytes());
+        out.extend_from_slice(&line[range.end..]);
+        return;
+    }
+    let brace = line.iter().position(|b| *b == b'{').unwrap_or(0);
+    out.extend_from_slice(&line[..=brace]);
+    out.extend_from_slice(b"\"at\":");
+    out.extend_from_slice(quoted.as_bytes());
+    let rest = &line[brace + 1..];
+    let next = rest
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .map(|i| rest[i]);
+    if next != Some(b'}') {
+        out.push(b',');
+    }
+    out.extend_from_slice(rest);
+}
+
 /// Look for `"timestamp"`, `"time_unix_nano"`, `"observed_time_unix_nano"` in
 /// the record and return an RFC 3339 string, or `None` if none found / parseable.
-fn resolve_at_from_aliases(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+fn resolve_at_from_aliases(fields: &[crate::json_scan::Field<'_>]) -> Option<String> {
     // Priority 1: "timestamp"
-    if let Some(v) = obj.get("timestamp") {
-        if let Some(s) = try_to_rfc3339(v, TimestampKey::Timestamp) {
+    if let Some(v) = crate::json_scan::find(fields, "timestamp") {
+        if let Some(s) = json_val_to_rfc3339(&v.value, TimestampKey::Timestamp) {
             return Some(s);
         }
     }
     // Priority 2: "time_unix_nano"
-    if let Some(v) = obj.get("time_unix_nano") {
-        if let Some(s) = try_to_rfc3339(v, TimestampKey::UnixNano) {
+    if let Some(v) = crate::json_scan::find(fields, "time_unix_nano") {
+        if let Some(s) = json_val_to_rfc3339(&v.value, TimestampKey::UnixNano) {
             return Some(s);
         }
     }
     // Priority 3: "observed_time_unix_nano"
-    if let Some(v) = obj.get("observed_time_unix_nano") {
-        if let Some(s) = try_to_rfc3339(v, TimestampKey::UnixNano) {
+    if let Some(v) = crate::json_scan::find(fields, "observed_time_unix_nano") {
+        if let Some(s) = json_val_to_rfc3339(&v.value, TimestampKey::UnixNano) {
             return Some(s);
         }
     }
     None
+}
+
+fn json_val_to_rfc3339(v: &crate::json_scan::JsonVal<'_>, key: TimestampKey) -> Option<String> {
+    match v {
+        crate::json_scan::JsonVal::String(s) => Some(s.clone()),
+        crate::json_scan::JsonVal::Number(raw) => {
+            let nanos = match key {
+                TimestampKey::UnixNano => raw.parse::<i64>().ok()?,
+                TimestampKey::Timestamp => numeric_timestamp_to_nanos(raw.parse::<f64>().ok()?)?,
+            };
+            let dt = DateTime::<Utc>::from_timestamp_nanos(nanos);
+            Some(dt.to_rfc3339())
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -166,32 +177,6 @@ enum TimestampKey {
     Timestamp,
     /// The `"time_unix_nano"` / `"observed_time_unix_nano"` keys — always nanos.
     UnixNano,
-}
-
-fn try_to_rfc3339(v: &serde_json::Value, key: TimestampKey) -> Option<String> {
-    match v {
-        serde_json::Value::String(s) => {
-            // String values are passed through verbatim. Arrow-json will parse
-            // RFC 3339 / ISO-ish strings directly. A garbage string lands as
-            // null downstream — same as today — so we don't validate here.
-            Some(s.clone())
-        }
-        serde_json::Value::Number(n) => {
-            let nanos = match key {
-                TimestampKey::UnixNano => {
-                    // Always nanoseconds.
-                    n.as_i64()?
-                }
-                TimestampKey::Timestamp => {
-                    // Ambiguous unit: heuristic based on magnitude.
-                    numeric_timestamp_to_nanos(n.as_f64()?)?
-                }
-            };
-            let dt = DateTime::<Utc>::from_timestamp_nanos(nanos);
-            Some(dt.to_rfc3339())
-        }
-        _ => None,
-    }
 }
 
 /// Convert a numeric `"timestamp"` value to nanoseconds using a magnitude
@@ -239,11 +224,7 @@ mod tests {
 
     fn schema_with_at() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new(
-                "at",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                true,
-            ),
+            Field::new("at", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
             Field::new("message", DataType::Utf8, true),
         ]))
     }
@@ -326,7 +307,11 @@ mod tests {
         let dt = DateTime::parse_from_rfc3339(at_str).expect("valid RFC3339");
         // Should be within 1 second of expected
         let expected_secs = millis / 1000;
-        assert_eq!(dt.timestamp(), expected_secs, "seconds portion should match");
+        assert_eq!(
+            dt.timestamp(),
+            expected_secs,
+            "seconds portion should match"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -366,6 +351,24 @@ mod tests {
     // -------------------------------------------------------------------------
     // (g) Malformed JSON line → copied through verbatim
     // -------------------------------------------------------------------------
+    #[test]
+    fn deep_nested_payload_with_timestamp_does_not_overflow() {
+        let schema = schema_with_at();
+        let mut ndjson = String::from("{\"timestamp\":\"2026-06-05T10:00:00Z\",\"props\":");
+        for _ in 0..2_000 {
+            ndjson.push_str("{\"a\":");
+        }
+        ndjson.push('1');
+        for _ in 0..2_000 {
+            ndjson.push('}');
+        }
+        ndjson.push_str("}\n");
+        let result = populate_at_column(ndjson.as_bytes(), &schema);
+        let output = std::str::from_utf8(result.as_ref()).unwrap();
+        assert!(output.contains("\"at\":\"2026-06-05T10:00:00Z\""));
+        assert!(output.contains("\"props\":"));
+    }
+
     #[test]
     fn malformed_json_line_copied_verbatim() {
         let schema = schema_with_at();
@@ -504,7 +507,11 @@ mod tests {
         let dt = DateTime::parse_from_rfc3339(at_str).expect("valid RFC3339");
         // microseconds / 1_000_000 = seconds
         let expected_secs = micros / 1_000_000;
-        assert_eq!(dt.timestamp(), expected_secs, "microseconds heuristic should recover seconds");
+        assert_eq!(
+            dt.timestamp(),
+            expected_secs,
+            "microseconds heuristic should recover seconds"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -562,7 +569,11 @@ mod tests {
         let at_str = parsed["at"].as_str().expect("at should be a string");
         let dt = DateTime::parse_from_rfc3339(at_str).expect("valid RFC3339");
         let expected_secs = val / 1_000_000;
-        assert_eq!(dt.timestamp(), expected_secs, "exactly 1e14 treated as microseconds");
+        assert_eq!(
+            dt.timestamp(),
+            expected_secs,
+            "exactly 1e14 treated as microseconds"
+        );
     }
 
     /// Exactly 1e16 → nanoseconds boundary (inclusive).
@@ -577,7 +588,11 @@ mod tests {
         let at_str = parsed["at"].as_str().expect("at should be a string");
         let dt = DateTime::parse_from_rfc3339(at_str).expect("valid RFC3339");
         let expected_secs = val / 1_000_000_000;
-        assert_eq!(dt.timestamp(), expected_secs, "exactly 1e16 treated as nanoseconds");
+        assert_eq!(
+            dt.timestamp(),
+            expected_secs,
+            "exactly 1e16 treated as nanoseconds"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -594,9 +609,16 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
         let at_str = parsed["at"].as_str().expect("at should be a string");
         let dt = DateTime::parse_from_rfc3339(at_str).expect("valid RFC3339");
-        assert_eq!(dt.timestamp(), secs, "negative seconds should yield pre-epoch datetime");
-        assert!(dt.format("%Y").to_string().parse::<i32>().unwrap() < 1970,
-            "year should be before 1970, got {}", dt.format("%Y"));
+        assert_eq!(
+            dt.timestamp(),
+            secs,
+            "negative seconds should yield pre-epoch datetime"
+        );
+        assert!(
+            dt.format("%Y").to_string().parse::<i32>().unwrap() < 1970,
+            "year should be before 1970, got {}",
+            dt.format("%Y")
+        );
     }
 
     // -------------------------------------------------------------------------

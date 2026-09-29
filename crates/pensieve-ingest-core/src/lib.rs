@@ -28,6 +28,7 @@ pub mod consumer_events;
 pub mod ensure;
 pub mod event_time;
 pub mod events;
+pub mod json_scan;
 pub mod ndjson;
 pub mod staging;
 pub use commit_coordinator::{CommitCoordinator, CoordinatorConfig};
@@ -36,11 +37,14 @@ pub use ensure::{
     default_table_schema, ensure_table, evolve_schema_for_records, MAX_NEW_COLUMNS_PER_REQUEST,
 };
 pub use events::{IngestEvents, RowsAppended};
+pub use json_scan::records_for_schema_evolve;
 pub use ndjson::{parse_ndjson, NdjsonError};
 pub use staging::{FlushOutcome, StagingBuffer, StagingConfig};
 
 use chrono::{DateTime, Utc};
-use pensieve_core::catalog::{Catalog, ExtentManifest, IngestLedgerEntry, SnapshotSummary, TableRef};
+use pensieve_core::catalog::{
+    Catalog, ExtentManifest, IngestLedgerEntry, SnapshotSummary, TableRef,
+};
 use pensieve_core::errors::{CatalogError, Error, Result};
 use pensieve_core::segment_format::{ExtentWriteResult, SegmentFormat};
 use pensieve_core::types::{SnapshotId, TableId};
